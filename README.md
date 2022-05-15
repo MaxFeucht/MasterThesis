@@ -21,7 +21,10 @@ Recent literature provides some evidence that CC and DC individuals might furthe
 
 In an exploratory manner, biomarkers in resting state activity were investigated in a novel approach. Resting state EEG activity was again wavelet transformed, yielding the power and phase of resting state oscillations over frequencies and time. Doing so, the power and phase of an individual's resting state activity could be represented as an image at every electrode. Due to this characteristic, Convolutional Neural Networks (CNNs) were tested for their ability to classify the resting state activity of CC and DC individuals, to infer on potential changes in task unrelated neural activity, possibly also in non-visual areas. Classification based on resting state activity was once [performed using data at all 32 electrodes](/CNN/32_channel_modeling.ipynb), i.e., classification of a 32-channel volume, and once [using only the data at the P8 electrode](/CNN/P8_channel_modeling.ipynb), i.e., a single image. A custom CNN was built and trained for this task, but also [transfer learning using the ResNet50](/CNN/ResNet_50_modeling.ipynb) was tested. To the best of my knowledge, the methodological approach explored on this analysis has not been applied to resting state activity to date, and bears large potential for subsequent research.
 
-Literature:
+
+
+
+#### Literature:
 
 [Bottari, D., Troje, N. F., Ley, P., Hense, M., Kekunnaya, R., & Röder, B. (2015). The neural
 development of the biological motion processing system does not rely on early visual
