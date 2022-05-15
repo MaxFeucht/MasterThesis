@@ -1,0 +1,699 @@
+---
+title: "SVM Analysis for all timepoints"
+output: html_notebook
+---
+
+
+
+```{r warning=FALSE}
+
+library(R.matlab)
+library(sjmisc)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(kernelboot)
+library(pROC)
+library(effsize)
+library(e1071)
+library(pracma)
+library(verification)
+library(progress)
+library(caret)
+library(LiblineaR)
+library(groupdata2)
+library(data.table)
+library(doParallel)
+library(betareg)
+
+```
+
+Defining with participant numbers belong to which group
+
+```{r}
+
+#Lists of participant numbers per groups, extracted from Excel file manually
+
+CC_no = c("TVD_0001", "TVD_0012", "TVD_0015", "TVD_0016", "TVD_0042", "TVD_0052", "TVD_0070", "TVD_0243", "TVD_0274", "TVD_0240", "TVD_0256", "TVD_0050")
+
+DC_no = c("TVD_0200", "TVD_0206", "TVD_0144", "TVD_0177", "TVD_0136", "TVD_0181", "TVD_0127", "TVD_0156", "TVD_0205", "TVD_0010", "TVD_0148", "TVD_0135", "TVD_0606")
+
+Control_no = c( "CO_0002_", "CO_0003_", "CO_0004_", "CO_0006_", "CO_0007_", "CO_0008_", "CO_0009_", "CO_0010_", "CO_0012_", "CO_0013_", "CO_0014_", "CO_0015_", "CO_0016_", "CO_0017_", "CO_0019_", "CO_0021_", "CO_0022_", "CO_0023_", "CO_0024_", "CO_0025_", "CO_0026_", "CO_0027_", "CO_0028_", "CO_0029_", "CO_0030_")
+
+```
+
+
+## Loading data for all timepoints
+
+In order to analyze the participants data for all timepoints, the data for all participants must be rearranged into a list of dataframes, one for each timepoint. To this end, a list of 1000 empty dataframes is created first, with the dimensionality as needed (25x32). Then, a list of files that need to be read in is created. Finally, the dataframes for the single participants are read. Each individual dataframe is of dimensions 32x1000, each row for one electrode and each column for one timepoint. By iterating over all columns, each column is written into one of the 1000 empty dataframes created earlier. The first column is written in the first dataframe, the second in the second, and so on. Each column of a participants dataframe is written into a row in the single dataframes, whereby the columns represent the single electrodes, and each dataframe represents a timepoint. The first participants data therefore appears as the first row, the second participants data appears as the second row, and so on. We finally obtain a list of 1000 dataframes, one for each timepoint, with each row of each dataframe representing one participant and each column representing one electrode. 
+
+
+```{r}
+
+
+## Function to instantiate a list of 1000 dfs, 
+instantiate_dflist <- function(nrows, ncols){
+  df_list <- list() 
+  for (i in seq(1000)){ 
+    df_list[[i]] <- data.frame(matrix(NA, nrow = nrows, ncol = ncols)) #create 1000 empty Matrices of desired dimensions
+  }
+  return(df_list)
+}
+
+
+
+## Function to store all filenames of a directory with a certain pattern in a list
+get_filelist <- function(wd, pattern) {
+  setwd(wd)
+  filelist = list()
+  for (file in list.files(wd, pattern=pattern, all.files=FALSE, full.names=FALSE)){ #Extract all filenames from the given directory that match a given pattern
+    filelist = append(filelist, file) #append each filename matching the pattern to the list
+  }
+  return(filelist)
+}
+
+## Function to convert ms to index positions in the list of dataframes
+ms_index <- function(int){
+  
+  index <- int + 501
+  
+  return(index)
+}
+
+
+## Function to write participant data from .mat files in the list of empty dataframes.
+write_files_to_list <- function(filelist, df_list, scale = TRUE){
+  
+  for (no_file in seq_along(filelist)) { #iterate over position in filelist
+    
+    df <- readMat(con = filelist[no_file]) # read .mat file from file position
+    df <- data.frame(df$timelock[1]) # select 'avg' from matlab structure
+    
+    
+    for (tp in seq_along(names(df))){ #iterate over timepoints (columns of dataframe)
+      
+      if (scale == TRUE){ #The values of the electrodes are scaled over all electrodes for one timepoint(column)
+              df_list[[tp]][no_file,1:32] <- scale(df[,tp]) # Assign one column to one df of the df list with the row corresponding to file position.
+      } else {
+        df_list[[tp]][no_file,1:32] <- df[,tp]
+      }
+      
+      part_no <- substr(filelist[no_file],1,8) # Participant number through first 8 characters of filename
+      df_list[[tp]][no_file,'participant_no'] <-  part_no  
+      
+      if (part_no %in% CC_no){ # Set group according to participant number
+      df_list[[tp]][no_file,'group'] <- "CC"
+      } else if (part_no %in% DC_no){
+        df_list[[tp]][no_file,'group'] <- "DC" 
+      } else if (part_no %in% Control_no){
+        df_list[[tp]][no_file,'group'] <- "Control"
+        
+      }  
+    }
+  }
+  return(df_list)
+}
+
+
+```
+
+Instantiate list of 1000 empty dataframes with dimensions 25x32 (for each group)
+
+```{r}
+
+df_list <- instantiate_dflist(25,32)
+
+```
+
+
+##Cataract Dataframes
+
+Application of the previously defined functions to the files within the cataract folder
+
+```{r warning=FALSE}
+
+setwd("/home/bpn/Dokumente/Max/Data/epochs_ft_exp_1/cataracts_S20_S40/")
+
+#get filenames from cataract directory
+filelist_cat <- get_filelist(getwd(),"S20")
+
+#Write control dataframes to list of dataframes
+cat <- write_files_to_list(filelist_cat, df_list, scale = TRUE)
+
+```
+
+
+##Control dataframes
+
+Application of the previously defined functions to the files within the control folder
+
+```{r warning=FALSE}
+
+setwd("/home/bpn/Dokumente/Max/Data/epochs_ft_exp_1/controls_S20_S40/")
+
+#get filenames from control directory
+filelist_con <- get_filelist(getwd(),"S20")
+
+#Write control dataframes to list of dataframes
+con <- write_files_to_list(filelist_con, df_list, scale = TRUE)
+
+```
+
+## Combining both lists of dataframes
+
+Creation of a new empty list of dataframes, this time with dimensions 50x34 (2 exta columns for participant number and group). Cataract individuals fill the first 26 rows and control individuals the last 26 rows for each timepoint.
+
+### Posterior electrodes only
+
+The current total list of dataframes contains all electrodes (32). As the analysis focuses only in the posterior electrodes, a new list of dataframes is created, containing only the electrodes (columns of single dfs) of interest. 
+
+```{r}
+
+total_dfs <- instantiate_dflist(50,34)
+
+for (i in seq(1000)) {
+  
+  total_dfs[[i]][1:25,] <- cat[[i]]
+  total_dfs[[i]][26:50,] <- con[[i]]
+  names(total_dfs[[i]]) <- names(cat[[i]])
+  
+}
+
+post <- total_dfs
+
+for (i in seq(1000)) {
+  
+  post[[i]] <- post[[i]][,c(18:30,33,34)]
+  
+}
+
+```
+
+
+# ANALYSIS
+
+# Defining functions for Analysis
+
+```{r}
+
+### Transform each dataframe according to needs
+transform_df <- function(data, control = TRUE) {
+
+  data <- data %>% mutate(isCC = factor(group != 'CC', labels = c("yes","no")))
+  data$group <- factor(data$group, levels = c("CC", "DC", "Control"))
+
+  if (control == FALSE) {
+    
+    data <- data[data$group %in% c('DC','CC'),]
+    
+  } else {
+    
+    data <- data
+    
+  }
+  
+  data <- data %>% dplyr::select(-c(participant_no, group))
+  
+  return(data)
+  
+}
+
+
+### Combine SVM Weights to the final classifier
+get_svm_classifier <- function(df, svm) {
+  
+  weights <- t(svm$coefs) %*% svm$SV # Dot product of SVM coefficients (alphas) and Support Vectors
+  weights_as_rows <- do.call(rbind, # Replicate weights to match the dimension of the dataframe
+                             replicate(dim(df)[1], 
+                             weights, 
+                             simplify=FALSE))
+
+    clf <- rowSums(df[,-ncol(df)]*weights_as_rows) #Multiply each feature (electrode) with the respective weight for each participant
+  
+  return(clf)
+}
+
+
+
+# Function for manual Cross-Validation (CV) with e1071
+inner_CV <- function(df, k, grid){
+  
+  # Create empty dataframe to store CV results
+  hpt_df_auc <- data.frame(matrix(NA, nrow = dim(grid)[1], ncol = k))
+  names(hpt_df_auc) <- seq(k)
+  
+  # Create CV folds
+  flds <- createFolds(df$isCC, k = k, list = TRUE, returnTrain = FALSE)
+  
+  # Loop over CV folds
+  for (f in seq(k)){
+    
+    # Partitioning the Data in Training and Testing Data
+    names(flds)[1:k] <- "train"
+    names(flds)[f] <- "test"
+    train_df <- df[-flds$test,]
+    test_df <- df[flds$test,]
+    
+    # Loop over all Hyperparameter Grid Combinations    
+    for (i in seq(dim(grid)[1])){
+      
+      # Training an SVM with the respective Hyperparameter Grid Combination
+      hpt_svm <- svm(isCC ~ ., 
+                     data = train_df, 
+                     kernel = "linear", 
+                     cost = grid[i,'cost'],
+                     class.weights = c("no" = as.numeric(1/table(train_df$isCC)[2]), 
+                                       "yes" = as.numeric(1/table(train_df$isCC)[1])),
+                     scale = FALSE)
+      
+      # Deriving a Classifier from the previously fitted SVM and unseen test data
+      clf <- get_svm_classifier(test_df, hpt_svm)
+
+      # Compute AUC value for the classifier
+      response <- ifelse(test_df$isCC == "yes",1,0)
+      dir = ifelse(train_df$isCC[1] == "no", ">", "<") # direction depends on whether the first case is a CC or Non-CC
+      rocObject <- roc(response, clf, direction = dir, print_auc = TRUE, quiet = TRUE)
+      
+      # Storing AUC values in dataframe
+      hpt_df_auc[i,f] <- as.numeric(rocObject$auc)
+      
+    }
+  }
+  
+  # Store mean AUCs for each Hyperparameter Combination over all folds with corresponding Hyperparameters
+  cv_results <- data.frame(matrix(NA, 
+                               nrow = dim(grid)[1], 
+                               ncol = 2)) 
+  
+  # Determine Names of result set columns
+  names(cv_results) <-c("cost", "AUC")
+  
+  # Assign values to result set columns
+  cv_results[,"cost"] <- grid[,"cost"]
+  cv_results[,"AUC"] <- rowMeans(hpt_df_auc)
+
+  # Return Cost and Weight that yielded the best mean AUC over all folds. 
+  # If more Combinations yielded the same best result, the first one is chosen
+  best_tune <- cv_results[cv_results[,"AUC"] == max(cv_results$AUC), ]
+  
+  # If multiple best tunes are returned, choose the first
+  if (dim(best_tune)[1] > 1)
+  output <- c(best_tune[1,]) else
+  output <- c(best_tune)
+  
+  return(output)
+  
+}
+
+
+
+```
+
+
+## Implementation of Hyperparameter Tuning with simple repeated Cross-Validation on all timepoints
+
+
+```{r}
+
+# Register 12 cores
+registerDoParallel(12)
+start <- Sys.time()
+
+# Set parameters for nested CV 
+repeats = 500 # How many times nested CV is repeated for each timepoint
+milliseconds = 600 # The range of milliseconds we want to cover
+step = 1    # step size with which to compute the classifications. 
+control = FALSE # Control participants included or not?
+inner_k = ifelse(control,5,3) # k for inner loop of nested CV - depends on whether controls are included
+
+# Define coarse Grid of Hyperparameters to search over in inner CV
+coarse_grid <- expand.grid(cost = 2^(seq(-5,15)))
+
+# Loop over all timepoints
+hpt_results <- foreach(ms = seq(0, milliseconds, step)) %dopar% {
+  
+  # Instantiate empty vector to store values
+  cost_list <- c()
+
+  #Selecting the right dataframe
+  offset <- 400
+  df <- transform_df(post[[offset + ms]], control = control) 
+  
+  #Loop for repeats of repeated CV
+  for (i in seq(repeats)) {
+    
+    # Running CV Loop to determine best Hyperparameters:
+    # First running a k-fold CV on the coarse grid and then fine-searching in the nearby areas
+    coarse_cv <- inner_CV(df, inner_k, coarse_grid)
+    best_coarse_cost <- log(coarse_cv$cost, 2)
+    
+    # Generating a fine grid based on best cost of coarse CV
+    fine_grid <- expand.grid(cost = 2^(seq(best_coarse_cost-2,
+                                           best_coarse_cost+2,
+                                           0.25)))
+    # Run CV with the fine value grid
+    best_hpts <- inner_CV(df, inner_k, fine_grid)
+    
+    # Save best Costs and Weights found in the Hyperparameter Tuning
+    cost_list <- c(cost_list, best_hpts$cost)
+  
+  }
+  
+  # Return cost list in each iteration
+  cost_list
+}
+
+# Check time passed since Cell was ran
+stop <- Sys.time()
+stop - start
+
+# Save Results as RDS file
+saveRDS(results, paste("Final_RDS_files/hpt_results_500rep_final", ifelse(control, "all", "dc"),".RDS", sep = ""))
+
+
+```
+
+
+# Generating the final models using the best costs from HP Tuning 
+
+
+```{r}
+
+control = TRUE # Whether CC vs. DC or CC vs. Non-CC data shall be loaded
+
+if (control)
+  hpt_results = readRDS("Final_RDS_files/hpt_results_500rep_finalall.RDS") else
+  hpt_results = readRDS("Final_RDS_files/hpt_results_500rep_finaldc.RDS")
+
+best_costs = c()
+
+for (hpt_result in hpt_results){
+  best_costs = c(best_costs, as.numeric(names(sort(table(hpt_result), decreasing = TRUE)[1])))
+}
+
+
+# Set parameters 
+milliseconds = 600 # The range of milliseconds we want to cover
+step = 1    # step size with which to compute the classifications. 
+
+# Loop over all timepoints
+results_final <- foreach (ms = seq(0, milliseconds, step)) %do% {
+  
+  # Selecting the right dataframe
+  offset <- 400
+  df <- transform_df(post[[offset + ms]], control = control) 
+  
+  # Train Model on all data with best Hyperparameters to generate our final model
+  final_model <- svm(isCC ~ ., 
+                 data = df, 
+                 kernel = "linear", 
+                 cost = best_costs[ms+1],
+                 class.weights =  c("no" = as.numeric(1/table(df$isCC)[2]), 
+                                    "yes" = as.numeric(1/table(df$isCC)[1])),
+                 scale = FALSE)
+  
+  # Predict Test Fold of the outer Loop:
+  # Computing an AUC through weights and raw electrode data
+  weights <- t(final_model$coefs) %*% final_model$SV 
+  weights_as_rows <- do.call(rbind, 
+                             replicate(dim(df)[1], 
+                             weights, 
+                             simplify=FALSE)) 
+  clf <- rowSums(df[,-ncol(df)]*weights_as_rows)
+  
+  # Remap the response to binary for pROC to understand 
+  response <- ifelse(df$isCC == "yes",1,0)
+  
+  # Direction depends on whether the first case is a CC or Non-CC
+  dir = ifelse(df$isCC[1] == "no", ">", "<") 
+  
+  # Fit ROC with correctly formatted response and direction
+  rocObject <- roc(response, 
+                   clf, 
+                   direction = "<", 
+                   print_auc = TRUE, 
+                   quiet = TRUE)
+  
+  threshold <- coords(rocObject, x = "best", best.method = "y", ret = "threshold", transpose = TRUE)
+
+  list("weights" = weights, "threshold" = threshold)
+}
+
+
+# Save the results according to CC vs. DC or CC vs. Non-CC indication
+if (control)
+  saveRDS(results_final, 'Final_RDS_files/final_weights_all_part.RDS')else
+  saveRDS(results_final, 'Final_RDS_files/final_weights_CCDC.RDS')
+
+
+                
+```
+
+# Performance Estimation based on Experiment 1
+
+## Implementation of nested CV on all timepoints for Performance estimation
+
+```{r}
+
+# Manual nCV with manual innerCV and parallel processing
+
+registerDoParallel(12)
+start <- Sys.time()
+
+# Set parameters for nested CV 
+repeats = 200 # How many times nested CV is repeated for each timepoint
+milliseconds = 600 # The range of milliseconds we want to cover
+step = 1    # step size with which to compute the classifications. 
+control = FALSE # Control participants included or not?
+outer_k = 3 # k for outer loop of nested CV 
+inner_k = ifelse(control,5,3) # k for inner loop of nested CV - depends on whether controls are included
+
+# Define coarse Grid of Hyperparameters to search over in inner CV
+coarse_grid <- expand.grid(cost = 2^(seq(-5,15)))
+
+# Loop over all timepoints
+results <- foreach(ms = seq(0, milliseconds, step)) %dopar% {
+  
+  # Instantiate empty vectors to store values
+  auc_list <- c()
+  auc_ci_list <- c()
+  cost_list <- c()
+  p_list = c()
+
+  #Selecting the right dataframe
+  offset <- 400
+  df <- transform_df(post[[offset + ms]], control = control) 
+  
+  # Creating empty Matrix to store results
+  hpt_auc <- data.frame(matrix(NA, nrow = repeats, ncol = outer_k))
+  names(hpt_auc) <- seq(outer_k)
+  
+  #Loop for repeats of repeated nCV
+  for (i in seq(repeats)) {
+    
+    # Creating outer Folds
+    outer_flds <- createFolds(df$isCC, 
+                              k = outer_k, 
+                              list = TRUE, 
+                              returnTrain = FALSE)
+    
+    for (o_f in seq(outer_k)){
+       
+      # Partitioning the Data in Training and Testing Data for Outer Loop
+      names(outer_flds)[1:outer_k] <- "train"
+      names(outer_flds)[o_f] <- "test"
+      outer_train_df <- df[-outer_flds$test,]
+      outer_test_df <- df[outer_flds$test,]
+      
+      # Running inner CV Loop to determine best Hyperparameters:
+      # First running a k-fold CV on the coarse grid and then fine-searching in the nearby areas
+      coarse_cv <- inner_CV(outer_train_df, inner_k, coarse_grid)
+      best_coarse_cost <- log(coarse_cv$cost, 2)
+      
+      # Generating a fine grid based on best cost of coarse CV
+      fine_grid <- expand.grid(cost = 2^(seq(best_coarse_cost-2,
+                                             best_coarse_cost+2,
+                                             0.25)))
+      best_hpts <- inner_CV(outer_train_df, inner_k, fine_grid)
+      
+      # Train Model on all data of the inner loop with best Hyperparameters
+      outer_model <- svm(isCC ~ ., 
+                     data = outer_train_df, 
+                     kernel = "linear", 
+                     cost = best_hpts$cost,
+                     class.weights = c("no" = as.numeric(1/table(outer_train_df$isCC)[2]), 
+                                       "yes" = as.numeric(1/table(outer_train_df$isCC)[1])),
+                     scale = FALSE)
+      
+      # Predictions for participants of test fold of the outer Loop:
+      # Computing an AUC through weights and raw electrode data
+      clf <- get_svm_classifier(outer_test_df,outer_model)
+      
+      # Remap the response to binary for pROC to understand 
+      response <- ifelse(outer_test_df$isCC == "yes",1,0)
+      
+      # Direction in cross-validation depends on whether the first case 
+      # in the training df is a CC or Non-CC; e1071 treats this as positive class
+      dir = ifelse(outer_train_df$isCC[1] == "no", ">", "<") 
+      
+      # Fit ROC with correctly formatted response and direction
+      rocObject <- roc(response, 
+                       clf, 
+                       direction = dir, 
+                       print_auc = TRUE, 
+                       quiet = TRUE)
+      
+      # Write single repetition- and fold-results into list for later averaging
+      auc_list <- c(auc_list,rocObject$auc) # AUC value
+      p_list <- c(p_list,auc_wmw(response,clf)) # p-value from WMW Test
+      
+      # Save best Costs and Weights found in the Hyperparameter Tuning
+      cost_list <- c(cost_list, best_hpts$cost)
+      
+    }
+    
+  }
+  
+  # Combine to dataframe
+  output_df <- cbind(auc_list, p_list, cost_list)
+      
+  output_df
+  
+}
+
+# Check time passed since Cell was ran
+stop <- Sys.time()
+stop - start
+
+# Save Results as RDS file
+saveRDS(results, paste("Final_RDS_files/ncv_results_200rep_final_", ifelse(control, "all", "dc"),".RDS", sep = ""))
+
+```
+
+# Defining function to plot performance estimation curve
+
+```{r}
+
+# Function to plot performance estimation curve
+plot_curve_erp <- function (auc, sd, control, p = c(rep(NA, 601)), val_sig){
+  
+  # Build dataframe to pass to ggplot
+  viz <- data.frame(auc = auc, 
+                    auc_sd = sd,
+                    p = p)
+  
+  # Adding the column for timepoint significance in validation
+  viz$val_sig <- NA # Instantiate with NAs
+  for (i in seq(601)) if (i %in% val_sig) viz[i,"val_sig"] <- 0.25 # Fill with value at which it shall be plotted, only for those timepoints that are significant (as indicated by input "val_sig"); all other timepoints stay NA and are thus not shown in the plot
+  
+  # Adding a column that indicates which timepoints are significant 
+  # in both validation as well as estimation
+  viz$p_both <- viz$p
+  viz$p_both[which(is.na(viz$val_sig))] <- NA
+  viz$p_both[which((!is.na(viz$p)) & (!is.na(viz$val_sig)))] <- 0.25 # Fill those entries with the value at which it shall be plotted, is both the p-value from estimation as well as the p-value from validation (val_sig) is significant.
+  
+
+  viz["timepoint"] <- - 100 + seq(1,dim(viz)[1],1) # Count timepoints from -100 till end
+  color_palette = c("#66c2a5", "#8da0cb")
+  color = color_palette[ifelse(control,1,2)] # Choose color depending on if controls are plotted or only CC vs. DC
+  
+  # Plot
+  {
+  ggplot(data=viz, aes(x = timepoint)) + 
+    geom_line(aes(y = auc, col = color)) +
+    geom_ribbon(aes(ymin = auc - auc_sd, ymax = ifelse((auc + auc_sd) > 1, 1, auc + auc_sd)), alpha = 0.3, fill = color) +
+    geom_point(aes(y = p, col = color)) +
+    geom_point(aes(y = val_sig, col = 'darkgrey'), size = 0.1) +
+    geom_point(aes(y = p_both, col = 'darkgrey'), size = 1) +
+    scale_y_continuous(breaks = seq(0.2,1,0.2), 
+                       labels = seq(0.2,1,0.2), 
+                       limits = c(0,1),
+                       expand = c(0,0)) +
+    scale_x_continuous(expand = c(0,0)) +
+    scale_colour_identity("AUC-Score", 
+                      breaks = c(color,"darkgrey"),
+                      labels = c("p < 0.05 and AUC > 0.7","Validation Significance"),
+                      guide = "legend") +
+    theme_bw(base_size = 15) +
+    geom_hline(yintercept = 0.5, size = 0.5, linetype='dotted') +
+    geom_vline(xintercept = 0, size = 0.2, linetype='dotted') +
+    theme(axis.line = element_line(size = 0.2, color = 'black'),
+          panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(), 
+          plot.background = element_blank(),
+          panel.border = element_blank(),
+          panel.grid.major.y = element_line(size=0.02, color="black"),
+          legend.position=c(.5,.1),
+          plot.title = element_text(size = 14,family="Helvetica", hjust = 0.5),
+          axis.title.y = element_text(size = 10, angle = 90,family="Helvetica"),
+          axis.title.x = element_text(size = 10, angle = 0, family="Helvetica"),
+          axis.text.x = element_text(size = 8, colour="black"),
+          axis.ticks.x = element_line(size = 0.2, colour="black"),
+          axis.text.y = element_text(size = 8, colour="black"),
+          axis.ticks.y = element_line(size = 0.2, colour="black"),
+          legend.background = element_rect(fill="white", size=.5, linetype="dotted"),
+          legend.text = element_text(colour="black", size = 10, family="Helvetica"),
+          legend.title = element_blank(),
+          legend.key.height = unit(0.1, 'cm'),
+          legend.key.width = unit(0.5, 'cm')) +
+    ggtitle("AUC over timepoints
+            ") +
+    xlab("Timepoints in ms") +
+    ylab("AUC") 
+    
+  }
+}
+
+```
+
+##Post-processing and plotting computed AUCs
+
+```{r warning=FALSE}
+
+control = F
+delogify <- function(x) exp(x) / (1+exp(x))
+
+if (control)
+  results = readRDS("Final_RDS_files/ncv_results_200rep_final_all.RDS") else
+  results = readRDS("Final_RDS_files/ncv_results_200rep_final_dc.RDS")
+
+i = 1
+df = data.frame()
+auc_list = c()
+auc_sd_list = c()
+best_costs = c()
+p_list = c()
+est_list = c()
+for (result in results){
+  aucs <- result[,1] # extract AUCs from result
+  costs <- result[,3] # xtract costs from result
+  auc_list = c(auc_list, mean(aucs)) # store mean AUCs
+  auc_sd_list = c(auc_sd_list, sd(aucs)) # store SDs of AUCs
+
+  # Computing p-values for AUCs against chance level with beta regression
+  aucs[aucs == 0] <- 0.0001 # Set values of 0 to a very small value close to zero
+  aucs[aucs == 1] <- 0.9999 # Set values of 1 to a very small value close to one
+  tp_df <- data.frame("AUC" = aucs)
+  beta_tp <- betareg(tp_df$AUC ~ 1, data = tp_df, link = "logit") # Compute model
+  p <- summary(beta_tp)$coefficients$mean[,4] # extract p-value
+  est <- summary(beta_tp)$coefficients$mean[,1] # extract estimate or verification
+  p_list = c(p_list, p) # Store p-values
+  est_list = c(est_list, est) # Store estimates
+}
+
+
+##Benjamini Hochberg correction
+p_adj = p.adjust(p_list, method = "BH")
+p_adj[auc_list < 0.7] <- NA # Setting all p-values at which the AUC is below 0.7 to NA
+
+saveRDS(p_adj,paste("significant_tps",ifelse(control, "all","dc"),".RDS", sep = ""))
+
+# Put this in the plot function
+p_adj[p_adj > 0.05] <- NA # Assigning NA to all nonsignificant p-values
+p_adj[p_adj < 0.05] <- 0.3 # Setting all other to 0.2 (for plot position)
+
+val_sig = readRDS(ifelse(control,"sig_all.RDS","sig_dc.RDS"))
+plot_curve_erp(auc_list,auc_sd_list, p = p_adj,val_sig = val_sig, control)
+
+```

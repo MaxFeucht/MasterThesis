@@ -1,0 +1,564 @@
+---
+title: "Validation of Time-Frequency Analyses with Elastic Net feature selection and SVM classification"
+output: html_notebook
+---
+
+
+
+```{r message=FALSE}
+
+library(R.matlab)
+library(sjmisc)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(kernelboot)
+library(pROC)
+library(effsize)
+library(e1071)
+library(pracma)
+library(verification)
+library(progress)
+library(caret)
+library(LiblineaR)
+library(groupdata2)
+library(sparseSVM)
+library(doParallel)
+library(stringr)
+library(glmnet)
+library(glmnetUtils)
+library(eNetXplorer)
+
+```
+
+## Participant numbers from experiment 2
+
+```{r}
+
+#Lists of participant numbers per groups, extracted from Excel file manually
+
+CC_no_val = c('TVD_0001','TVD_0042','TVD_0277','TVD_0012','TVD_0016','TVD_0052','TVD_0070','TVD_0243','TVD_0229','TVD_0050','TVD_0256','TVD_0240','TVD_0145')
+
+DC_no_val = c('TVD_0148','TVD_0144','TVD_0136','TVD_0127','TVD_0112','TVD_0104','TVD_0205','TVD_0010','TVD_0156','TVD_0059','TVD_0206','TVD_0620','TVD_0622','TVD_0624','TVD_0627')
+
+Control_no_val = c('CO_0001_','CO_0004_','CO_0005_','CO_0006_','CO_0009_','CO_0010_','CO_0011_','CO_0012_','CO_0013_','CO_0014_','CO_0015_','CO_0016_','CO_0017_','CO_0018_','CO_0022_','CO_0023_','CO_0024_','CO_0025_','CO_0026_','CO_0029_','CO_0030_','CO_0031_','CO_0032_','CO_0033_','CO_0036_','CO_0037_','CO_0038_','CO_0039_')
+
+
+```
+
+
+## Loading data for all timepoints
+
+
+```{r}
+
+
+## Function to store all filenames of a directory with a certain pattern in a list
+
+get_filelist <- function(wd, pattern) {
+  setwd(wd)
+  filelist = list()
+  for (file in list.files(wd, pattern=pattern, all.files=FALSE, full.names=FALSE)){ #Extract all filenames from the given directory that match a given pattern
+    filelist = append(filelist, file) #append each filename matching the pattern to the list
+  }
+  return(filelist)
+}
+
+# Function to transform the single matlab structure of each participant into one long dataframe with 15k cols and one row
+transform_tf <- function(mat_structure, tf_df, scale){
+  names = c()
+  for (tp in seq_along(seq(39,dim(tf_df)[2],39))){ #iterate over timepoints; each 39th column is a new timepoint (39 freq values per timepoint)
+    names = c(names, sapply(mat_structure[2][[1]], function(x) paste(tp, "ms", x, "hz", sep ="_"))) #Generate names based on timepoint and frequency
+  }
+  names(tf_df) <- names # Name Frequency*Timepoint columns of dataframe containing the ITPC and Power values (rows still exist as electrodes)
+  tf_df$electrode <- sapply(mat_structure[3][[1]], unlist) # Name electrode column
+  long <- tf_df %>% pivot_longer(!electrode, names_to = "frequency", values_to = "power") #Transform to long dataframe; the previously generate frequency*timepoint names are store in the "frequency" column
+  names_full = paste(long$electrode, long$frequency, sep = "_") #generate names from columns for later use; Now the names are Electrode*Frequency*Timepoint
+  if (scale) # Indicates whether data shall be scaled
+    long <- scale(long[,3]) else #the third column contains the actual values, the other ones were just used to generate column names
+    long <- long[,3]
+  long[is.na(long)] <- 0 #NA values are assigned 0
+  long <- data.frame(t(long)) #transpose and save as df
+  names(long) <- names_full #assign previously generated names
+
+  return(long)
+}
+
+
+# Function to assign Group Names based on participant number
+get_group_val <- function(part_no){
+  if (part_no %in% CC_no_val){ # Set group according to participant number
+    group <- "CC"
+  } else if (part_no %in% DC_no_val){
+    group <- "DC"
+  } else if (part_no %in% Control_no_val){
+    group <- "Control"
+  }
+  group
+}
+
+## Function to write participant data from .mat files in an empty dataframe. The empty dataframe is filled participant by participant
+write_files_to_list_val <- function(filelist, df_empty, scale = TRUE, rel = FALSE){
+
+
+  for (no_file in seq_along(filelist)) { #iterate over position in filelist
+
+    mat <- readMat(con = filelist[no_file]) # read .mat file from file position
+
+    if (rel == TRUE){ # rel indicates whether RELative ower change shall be loaded, or ITPC
+      mat_structure <- mat$totalpower.baselined.relchange # select relative power
+      df_full <- data.frame(mat_structure[5]) # 5 is the position of powspctrm in matlab structure
+    } else{
+      mat_structure <- mat$totalpower.itpc.itlc # select itpc
+      df_full <- data.frame(mat_structure[8]) # 8 is the position of itpc
+      }
+
+    part_no <- substr(filelist[no_file],28,35) #get participant number from filename
+    group <- get_group_val(part_no) #get group from participant number
+    long_df <- transform_tf(mat_structure,df_full, scale = scale)
+    df_empty[no_file,] <- cbind(long_df, part_no, group) #assign each participant to one row
+    names(df_empty) <- c(names(long_df), "part_no", "group")
+    }
+
+  output <- list("type" = ifelse(rel, "rel_power", "itpc"), "data" = df_empty)
+  return(output)
+}
+
+
+
+```
+
+# Reading and Transforming Dataframes: ITPC
+
+Application of the previously defined functions to the files of cataracts / controls
+
+```{r warning=FALSE}
+
+# Instantiate empty dataframe of fitting size:
+# 28 rows, one for each participant
+# Number of columns: 32*39*71 +2
+# 32 for 32 electrodes
+# 39 for 1 Hz frequency bins from 2 to 40 Hz
+# 71 for 20ms time bins from -700 to + 700 ms
+# +2 for participant number and group
+
+empty_cat <- data.frame(matrix(NA, nrow = 28, ncol = 32*39*71 +2))
+empty_con <- empty_cat
+
+scale = FALSE # Indicates whether the data should be scaled when loaded
+rel = FALSE # Indicates whether relative power change shall be loaded, if not then ITPC is loaded
+
+path <- paste("/home/bpn/Dokumente/Max/Data/Wavelet/wavelets_exp2/",
+              ifelse(rel,"Rel_Power","ITPC"),
+              sep = "")
+
+#get filenames from cataract directory (indicated by "TVD")
+filelist_cat_val <- get_filelist(path,"TVD")
+
+#Write control dataframes to list of dataframes
+cat_val <- write_files_to_list_val(filelist_cat_val, empty_cat, scale = scale, rel = rel)
+
+#get filenames from cataract directory (indicated by "CO")
+filelist_con_val <- get_filelist(path,"CO")
+
+#Write control dataframes to list of dataframes
+con_val <- write_files_to_list_val(filelist_con_val, empty_con, scale = scale, rel = rel)
+
+```
+
+# Reading and Transforming Dataframes: Relative Power Change
+
+Application of the previously defined functions to the files of cataracts / controls
+
+```{r warning=FALSE}
+
+scale = FALSE # Indicates whether the data should be scaled when loaded
+rel = TRUE # Indicates whether relative Data shall be loaded
+
+path <- paste("/home/bpn/Dokumente/Max/Data/Wavelet/wavelets_exp2/",
+              ifelse(rel,"Rel_Power","ITPC"),
+              sep = "")
+
+#get filenames from cataract directory
+filelist_cat_val <- get_filelist(path,"TVD")
+
+#Write control dataframes to list of dataframes
+cat_rel_val <- write_files_to_list_val(filelist_cat_val,empty_cat, scale = scale, rel = rel)
+
+#get filenames from cataract directory
+filelist_con_val <- get_filelist(path,"CO")
+
+#Write control dataframes to list of dataframes
+con_rel_val <- write_files_to_list_val(filelist_con_val, empty_con, scale = scale, rel = rel)
+
+```
+
+# Combining cataracts and controls and combinign ITPC and Rel_Power into large DF
+
+```{r}
+nrows = 56 # 56 participants for experiment 2
+
+# Explanation for number of columns: Same as when loading the data
+total_pow_val <- data.frame(matrix(NA, nrow = nrows, ncol = 32*39*71+2))
+total_itpc_val <- data.frame(matrix(NA, nrow = nrows, ncol = 32*39*71+2))
+
+# The rows are filled first with cataract, and then with control individuals
+total_itpc_val[1:(nrows/2),] <- cat_val$data
+total_itpc_val[(nrows/2+1):nrows,] <- con_val$data
+total_pow_val[1:(nrows/2),] <- cat_rel_val$data
+total_pow_val[(nrows/2+1):nrows,] <- con_rel_val$data
+
+names(total_pow_val) <- names(cat_rel_val$data)
+names(total_itpc_val) <- names(cat_val$data)
+
+
+# Select only posterior electrodes (by name)
+post_pow_val <- total_pow_val
+post_itpc_val <- total_itpc_val
+post_pow_val <- post_pow_val[, grep(pattern="^TP9|CP5|CP1|CP2|CP6|TP10|P7|P3|Pz|P4|P8|O1|O2|part_no|group", colnames(post_pow_val))]
+post_itpc_val <- post_itpc_val[, grep(pattern="^TP9|CP5|CP1|CP2|CP6|TP10|P7|P3|Pz|P4|P8|O1|O2|part_no|group", colnames(post_itpc_val))]
+
+
+# Select only timepoints from -100 to 500 ms for analysis: -700ms = 1ms, 700 ms = 71ms, -100 = 31ms, 500 = 61ms
+ms_string = sapply(c(31:61), function(x) paste(as.character(x),"_ms", sep =""))
+analysis_pattern = paste(ms_string,collapse = "|")
+analysis_pattern = paste(analysis_pattern, "part_no", "group", sep = "|")
+
+analysis_pow_val <- post_pow_val[, grep(pattern=analysis_pattern, colnames(post_pow_val))]
+analysis_itpc_val <- post_itpc_val[, grep(pattern=analysis_pattern, colnames(post_itpc_val))]
+
+
+```
+
+## Combining both ITPC and relative power data into one dataframe for combined domain analyses
+
+```{r}
+
+# Preprocess ITPC and Power
+itpc_comb_val <- analysis_itpc_val[,-c((ncol(analysis_itpc_val)-1) : ncol(analysis_itpc_val))] # Drop last two columns
+pow_comb_val <- analysis_pow_val[,-c((ncol(analysis_pow_val)-1) : ncol(analysis_pow_val))]  # Drop last two columns
+col_names_val <- names(itpc_comb_val) # Extract names
+
+# Normalize over all participants; needed as data is on different scales
+norm_image <- function(x) (x - mean(as.matrix(x))) / sd(as.matrix(x))
+itpc_comb_val <- norm_image(itpc_comb_val)
+pow_comb_val <- norm_image(pow_comb_val)
+
+# Combining both dataframes, and add the two columns participant number and group
+itpc_power_val <- cbind(itpc_comb_val, pow_comb_val, analysis_itpc_val[,c((ncol(analysis_itpc_val)-1) : ncol(analysis_itpc_val))])
+names(itpc_power_val) <- c(paste("itpc", names(itpc_comb_val), sep = "_"), paste("pow", names(pow_comb_val), sep = "_"),"part_no","group")
+
+# Sanity check: Mean and SD of combined dataframe, should be 0 and 1 or very close
+mean(as.matrix(itpc_power_val[,-c((ncol(itpc_power_val)-1) : ncol(itpc_power_val))]))
+sd(as.matrix(itpc_power_val[,-c((ncol(itpc_power_val)-1) : ncol(itpc_power_val))]))
+
+
+
+```
+
+# Functions for Validation
+
+```{r}
+
+
+### Transform each dataframe according to needs
+transform_df <- function(data, control = TRUE) {
+
+  data <- data %>% mutate(isCC = factor(group != 'CC', labels = c("yes","no"))) # Build new column that indicates whether a participant is CC or not
+  data$group <- factor(data$group, levels = c("CC", "DC", "Control"))
+
+  if (control == FALSE) {
+
+    data <- data[data$group %in% c('DC','CC'),] #subset only CC and DC individuals f control == F
+
+  } else {
+
+    data <- data
+
+  }
+
+  data <- data %>% dplyr::select(-c(part_no, group))
+
+  return(data)
+
+}
+
+## Cross-Validation of e1071 SVM with selected features
+load_model <- function(itpc_ = itpc, control_ = control, combined_ = combined){
+
+  # Assign name to domain to load correct data based on input
+  if(combined_)
+    domain = "combined_" else
+      domain = ifelse(itpc_, "itpc_", "pow_")
+
+  group <- ifelse(control_, "control","dc")
+
+  # Load weights
+  results_final <- readRDS(paste("Final_RDS_files/weights_",
+                                 domain,
+                                 group,
+                                 ".RDS", sep = ""))
+
+  # Load features selected in feature selection procedure
+  coefs <- readRDS(paste("Final_RDS_files/final_features_",
+                         domain,
+                         group,
+                         ".RDS", sep = ""))$coefs
+
+  selected_features = coefs@Dimnames[[1]][which(coefs != 0)]
+  selected_features = c(selected_features[2:length(selected_features)],"isCC")
+
+  output <- list("weights" = results_final$weights, "selected_features" = selected_features, "threshold" = results_final$threshold)
+}
+
+
+# Function to determine significance of AUC with Mann-Whitney-U-Test
+auc_wmw <- function(response, scores){
+
+  labels <- as.logical(response)
+  pos <- scores[labels]
+  neg <- scores[!labels]
+  wilcox.test(pos, neg)$p.value
+
+}
+
+
+# Function to load data, derive a classifier from loaded weights and obtain an ROC curve with p-value for AUC
+validation <- function(itpc_ = itpc, control_ = control, combined_ = combined, only_new = F){
+
+  # Load model according to input
+  exp1 <- load_model(itpc_,control_,combined_)
+
+  #Choose dataframe according to input
+  if (itpc_)
+    df <- transform_df(analysis_itpc_val, control = control_) else
+      df <- transform_df(analysis_pow_val, control = control_)
+
+  if (combined_)
+    df <- transform_df(itpc_power_val, control = control_)
+
+  # Check if only paticipants shall be included that are unique to experiment 2
+  if(only_new) {
+    new_indices <- analysis_itpc_val$part_no %in% all_new #all_new is a list defined when needed; only_new = T would thus throw an error if called too early
+    df <- df[new_indices,]
+  }
+
+  # Subset selected features
+  df = df[exp1$selected_features]
+
+  # Derive classifier and build ROC analysis
+  weights <- as.vector(exp1$weights)
+  weights_as_rows <- do.call(rbind,
+                             replicate(dim(df)[1],
+                                       weights,
+                                       simplify=FALSE))
+  clf_val <- rowSums(df[,-ncol(df)]*weights_as_rows)
+  response_val <- ifelse(df$isCC == "yes",1,0)
+  rocObject <- roc(response_val,
+                   clf_val,
+                   print_auc = TRUE,
+                   quiet = TRUE,
+                   ci = TRUE)
+
+  p <- auc_wmw(response_val,clf_val) # p-value from WMW Test
+  sens_spec = coords(rocObject, exp1$threshold, input = "threshold", transpose = TRUE) #Get sensitivity and specificity at best threshold from exp 1
+
+  return(list("roc" = rocObject, "p_val" = p, "sens_spec" = sens_spec, "thresh" = exp1$threshold))
+
+}
+
+
+# Function to plot ROC curve
+plot_curve <- function(validation, control){
+
+  # Set options: Square plot and do not show progress bar during bootstrapping
+  par(pty = "s")
+  options(pROCProgress = list(name = "none"))
+
+  # Plot ROC curve from ROC object with custom text that shows the AUC, the p-value and the CIs
+  plot_roc_val <- plot.roc(validation$roc,
+                           percent=TRUE,
+                           print.auc = TRUE,
+                           print.auc.pattern = paste("  AUC = %.3f\n [%.3f - %.3f]","\n     p",
+                                                     ifelse(validation$p_val<0.001," < 0.001",paste("=",round(validation$p_val,3)))),
+                           print.thres = validation$thresh,
+                           print.thres.pattern = "",
+                           smooth=FALSE,
+                           col=ifelse(control, "#009e73", "#8da0cb"))
+  plot(ci.se(plot_roc_val, specificities=seq(0, 1, 0.01)), type="shape", no.roc = TRUE, col=ifelse(control, "#009e7322", "#8da0cb22"), border = 0, quiet = T)
+
+}
+
+
+
+
+
+
+```
+
+
+## Validation - Experiment 2
+
+
+```{r warning=FALSE}
+
+## Single Domains ##
+control = TRUE
+
+# ITPC CC vs. Non-CC
+val_itpc_all <- validation(T,control,F)
+plot_curve(val_itpc_all,control)
+
+# Power CC vs. Non-CC
+val_pow_all <- validation(F,control,F)
+plot_curve(val_pow_all,control)
+
+control = FALSE
+
+# ITPC CC vs. DC
+val_itpc_dc <- validation(T,control,F)
+plot_curve(val_itpc_dc,control)
+
+# Power CC vs. DC
+val_pow_dc <- validation(F,control,F)
+plot_curve(val_pow_dc,control)
+
+## Combined ##
+control = TRUE
+
+# Combined CC vs. Non-CC
+val_combined_all <- validation(T,T,T)
+plot_curve(val_combined_all,control)
+
+control = FALSE
+
+# Combined CC vs. DC
+val_combined_dc <- validation(T,F,T)
+plot_curve(val_combined_dc,control)
+
+```
+
+
+## Validation - only participants unique to experiment 2
+
+
+
+```{r}
+
+# Participant IDs per experiment
+
+## Experiment 1
+CC_1 = c("TVD_0001", "TVD_0012", "TVD_0015", "TVD_0016", "TVD_0042", "TVD_0052", "TVD_0070", "TVD_0243", "TVD_0274", "TVD_0240", "TVD_0256", "TVD_0050")
+
+DC_1 = c("TVD_0200", "TVD_0206", "TVD_0144", "TVD_0177", "TVD_0136", "TVD_0181", "TVD_0127", "TVD_0156", "TVD_0205", "TVD_0010", "TVD_0148", "TVD_0135", "TVD_0606")
+
+## Experiment 2
+CC_2 = c('TVD_0001','TVD_0042','TVD_0277','TVD_0012','TVD_0016','TVD_0052','TVD_0070','TVD_0243','TVD_0229','TVD_0050','TVD_0256','TVD_0240','TVD_0145')
+
+DC_2 = c('TVD_0148','TVD_0144','TVD_0136','TVD_0127','TVD_0112','TVD_0104','TVD_0205','TVD_0010','TVD_0156','TVD_0059','TVD_0620','TVD_0622','TVD_0624','TVD_0627','TVD_0206')
+
+# Build function to subset IDs
+`%notin%` <- Negate(`%in%`)
+
+# Select participants that are not included in experiment 1
+CC_new = c()
+for (i in CC_2) if (i %notin% CC_1) CC_new = append(CC_new, i)
+
+DC_new = c()
+for (i in DC_2) if (i %notin% DC_1) DC_new = append(DC_new, i)
+
+# Select all Controls for comparability to Suddha's study
+for (i in Control_no_val) Control_new = append(Control_new, i)
+
+# Combine IDs of all participants new to experiment 2
+all_new = c(CC_new, DC_new, Control_new)
+
+
+## Single Domains ##
+
+control = TRUE
+
+#ITPC CC vs. Non-CC
+val_itpc_all_new <- validation(T,T,F,only_new = T)
+plot_curve(val_itpc_all_new, control)
+
+#Power CC vs. Non-CC
+val_pow_all_new <- validation(F,T,F,only_new = T)
+plot_curve(val_pow_all_new, control)
+
+control = FALSE
+
+#ITPC CC vs. DC
+val_itpc_dc_new <- validation(T,F,F,only_new = T)
+plot_curve(val_itpc_dc_new, control)
+
+#Power CC vs. DC
+val_pow_dc_new <- validation(F,F,F,only_new = T)
+plot_curve(val_pow_dc_new, control)
+
+
+## Combined Domains ##
+
+#Combined CC vs. Non-CC
+val_combined_all_new <- validation(T,T,T,only_new = T)
+plot_curve(val_combined_all_new, T)
+
+#Combined CC vs. DC
+val_combined_dc_new <- validation(T,F,T,only_new = T)
+plot_curve(val_combined_dc_new, F)
+
+
+```
+
+# Exploratory Analysis:
+
+Validating CC vs. Non-CC classification with Power features selected for CC vs. DC classification, to check whether low AUC value in CC vs. Non-CC results from the low number of selected features
+
+```{r}
+
+validation_exploratory <- function(itpc_ = itpc, control_ = control, combined_ = combined, only_new = F){
+
+  # Load model trained for CC vs. DC classification, regardless of "control_" input;
+  # the rest of the function is similar to the validation function defined above
+  exp1 <- load_model(itpc_,control = F,combined_)
+
+  #Choose dataframe
+  if (itpc_)
+    df <- transform_df(analysis_itpc_val, control = control_) else
+      df <- transform_df(analysis_pow_val, control = control_)
+
+  if (combined_)
+    df <- transform_df(itpc_power_val, control = control_)
+
+  if(only_new) {
+    new_indices <- analysis_itpc_val$part_no %in% all_new
+    df <- df[new_indices,]
+  }
+
+  df = df[exp1$selected_features]
+
+  weights <- as.vector(exp1$weights)
+  weights_as_rows <- do.call(rbind,
+                             replicate(dim(df)[1],
+                                       weights,
+                                       simplify=FALSE))
+  clf_val <- rowSums(df[,-ncol(df)]*weights_as_rows)
+  response_val <- ifelse(df$isCC == "yes",1,0)
+  rocObject <- roc(response_val,
+                   clf_val,
+                   print_auc = TRUE,
+                   quiet = TRUE,
+                   ci = TRUE)
+
+  p <- auc_wmw(response_val,clf_val) # p-value from WMW Test
+  sens_spec = coords(rocObject, exp1$threshold, input = "threshold", transpose = TRUE)
+
+  return(list("roc" = rocObject, "p_val" = p, "sens_spec" = sens_spec, "thresh" = exp1$threshold))
+
+}
+
+val_pow_all <- validation_exploratory(F,T,F)
+plot_curve(val_pow_all,T)
+```
+
