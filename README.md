@@ -14,7 +14,7 @@ CC individuals were reported to exhibit a lower amplitude in the P1 wave of visu
 
 ### Part 2: Biomarkers in event related oscillatory activity
 
-Recent literature provides some evidence that CC and DC individuals might further differ in the power and phase of neural oscillations following stimulus observation (Bottari, 2015). Thus, the second part of my thesis aimed at identifying biomarkers to classify CC and DC individuals in data of event related oscillatory activity. To this end, the EEG data was wavelet transformed, yielding the power change relative to a baseline interval and intertrial phase coherence of neural oscillations over frequencies and time, relative to stimulus onset. To reduce the dimensionality of the data, an elastic net regularized logistic regression model was used for feature selection, and subsequent classification based on the selected features was again performed using SVMs. The code for [feature selection and training](/SVM/ElasticNet_Training.Rmd) and [validation](/SVM/ElasticNet_Validation.Rmd) can be found in this repository.
+Recent literature provides some evidence that CC and DC individuals might further differ in the power and phase of neural oscillations following stimulus observation ([Bottari, 2015](https://doi.org/10.1016/j.cortex.2015.07.029)). Thus, the second part of my thesis aimed at identifying biomarkers to classify CC and DC individuals in data of event related oscillatory activity. To this end, the EEG data was wavelet transformed, yielding the power change relative to a baseline interval and intertrial phase coherence of neural oscillations over frequencies and time, relative to stimulus onset. To reduce the dimensionality of the data, an elastic net regularized logistic regression model was used for feature selection, and subsequent classification based on the selected features was again performed using SVMs. The code for [feature selection and training](/SVM/ElasticNet_Training.Rmd) and [validation](/SVM/ElasticNet_Validation.Rmd) can be found in this repository.
 
 
 ### Part 3: Biomarkers in resting state activity
@@ -23,10 +23,13 @@ In an exploratory manner, biomarkers in resting state activity were investigated
 
 Literature:
 
-[Sourav, S., Bottari, D., Shareef, I., Kekunnaya, R., & Röder, B. (2020). An electrophysiological biomarker for the classification of cataract-reversal patients: A case-control study. EClinicalMedicine, 27, 100559.] (https://doi.org/10.1016/j.eclinm.2020.100559)
-
 [Bottari, D., Troje, N. F., Ley, P., Hense, M., Kekunnaya, R., & Röder, B. (2015). The neural
 development of the biological motion processing system does not rely on early visual
 input. Cortex, 71, 9.](https://doi.org/10.1016/j.cortex.2015.07.029)
+
+[Sourav, S., Bottari, D., Kekunnaya, R., & Röder, B. (2018). Evidence of a retinotopic organization of early visual cortex but impaired extrastriate processing in sight recovery individuals. Journal of Vision, 18(3), 284–296.](https://doi.org/10.1167/18.3.22)
+
+[Sourav, S., Bottari, D., Shareef, I., Kekunnaya, R., & Röder, B. (2020). An electrophysiological biomarker for the classification of cataract-reversal patients: A case-control study. EClinicalMedicine, 27, 100559.](https://doi.org/10.1016/j.eclinm.2020.100559)
+
 
 
