@@ -1,0 +1,1168 @@
+---
+title: "Time-Frequency Analyses with Elastic Net feature selection and SVM classification"
+output: html_notebook
+---
+
+
+
+```{r message=FALSE}
+
+library(R.matlab)
+library(sjmisc)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(kernelboot)
+library(pROC)
+library(effsize)
+library(e1071)
+library(pracma)
+library(verification)
+library(progress)
+library(caret)
+library(LiblineaR)
+library(groupdata2)
+library(doParallel)
+library(stringr)
+library(glmnet)
+library(glmnetUtils)
+library(eNetXplorer)
+
+options(dplyr.summarise.inform = FALSE)
+
+```
+
+Defining which participant numbers belong to which group
+
+```{r}
+
+#Lists of participant numbers per groups, extracted from Excel file manually
+
+CC_no = c("TVD_0001", "TVD_0012", "TVD_0015", "TVD_0016", "TVD_0042", "TVD_0052", "TVD_0070", "TVD_0243", "TVD_0274", "TVD_0240", "TVD_0256", "TVD_0050")
+
+DC_no = c("TVD_0200", "TVD_0206", "TVD_0144", "TVD_0177", "TVD_0136", "TVD_0181", "TVD_0127", "TVD_0156", "TVD_0205", "TVD_0010", "TVD_0148", "TVD_0135", "TVD_0606")
+
+Control_no = c( "CO_0002_", "CO_0003_", "CO_0004_", "CO_0006_", "CO_0007_", "CO_0008_", "CO_0009_", "CO_0010_", "CO_0012_", "CO_0013_", "CO_0014_", "CO_0015_", "CO_0016_", "CO_0017_", "CO_0019_", "CO_0021_", "CO_0022_", "CO_0023_", "CO_0024_", "CO_0025_", "CO_0026_", "CO_0027_", "CO_0028_", "CO_0029_", "CO_0030_")
+
+
+```
+
+
+## Loading data for all timepoints
+
+In order to analyze the participants data for all timepoints, the data for all participants must be rearranged into a list of dataframes, one for each timepoint. To this end, a list of 1000 empty dataframes is created first, with the dimensionality as needed (52x32). Then, a list of files that need to be read in is created. Finally, the dataframes for the single participants are read. Eac individual dataframe is of dimensions 32x1000, each row for one electrode and each column for one timepoint. By iterating over all columns, each column is written into one of the 1000 empty dataframes created earlier. The first column of is written in the first dataframe, the second in the second, and so on. Each column of a participants dataframe is written into a row in the single timepoints dataframes, whereby the columns represent the single electrodes. The first participants data therefore appears as the first row, the second participants data appears as the second row, and so on. We finally obtain a list of 1000 dataframes, one for each timepoint, with each row of each dataframe representing one participant and each column representing one electrode. 
+
+
+```{r}
+
+
+## Function to store all filenames of a directory with a certain pattern in a list
+
+get_filelist <- function(wd, pattern) {
+  setwd(wd)
+  filelist = list()
+  for (file in list.files(wd, pattern=pattern, all.files=FALSE, full.names=FALSE)){ #Extract all filenames from the given directory that match a given pattern
+    filelist = append(filelist, file) #append each filename matching the pattern to the list
+  }
+  return(filelist)
+}
+
+# Function to transform the single matlab structure of each participant into one long dataframe with 15k cols and one row
+transform_tf <- function(mat_structure, tf_df, scale){
+  names = c()
+  for (tp in seq_along(seq(39,dim(tf_df)[2],39))){ #iterate over timepoints; each 39th column is a new timepoint (39 freq values per timepoint)
+    names = c(names, sapply(mat_structure[2][[1]], function(x) paste(tp, "ms", x, "hz", sep ="_"))) #Generate names based on timepoint and frequency
+  }
+  names(tf_df) <- names # Name Frequency*Timepoint columns of dataframe containing the ITPC and Power values (rows still exist as electrodes)
+  tf_df$electrode <- sapply(mat_structure[3][[1]], unlist) # Name electrode column from information stored in matlab structure
+  long <- tf_df %>% pivot_longer(!electrode, names_to = "frequency", values_to = "power") #Transform to long dataframe; the previously generate frequency*timepoint names are store in the "frequency" column
+  names_full = paste(long$electrode, long$frequency, sep = "_") #generate names from columns for later use; Now the names are Electrode*Frequency*timepoint
+  if (scale) # Indicates whether data shall be scaled
+    long <- scale(long[,3]) else #the third column contains the actual values, the other ones were just used to generate column names
+    long <- long[,3] 
+  long[is.na(long)] <- 0 #NA values are assigned 0
+  long <- data.frame(t(long)) #transpose and save as dataframe
+  names(long) <- names_full #assign previously generated names
+  
+  return(long)
+} 
+
+
+# Function to assign Group Names based on participant number
+get_group <- function(part_no){
+  if (part_no %in% CC_no){ # Set group according to participant number
+    group <- "CC"
+  } else if (part_no %in% DC_no){
+    group <- "DC" 
+  } else if (part_no %in% Control_no){
+    group <- "Control"
+  } 
+  group
+} 
+
+## Function to write participant data from .mat files in an empty dataframe. The empty dataframe is filled participant by participant
+write_files_to_list <- function(filelist, df_empty, scale = TRUE, rel = FALSE){
+  
+    
+  for (no_file in seq_along(filelist)) { #iterate over position in filelist
+    
+    mat <- readMat(con = filelist[no_file]) # read .mat file from file position
+    
+    if (rel == TRUE){ # rel indicates whether RELative ower change shall be loaded, or ITPC
+      mat_structure <- mat$totalpower.baselined.relchange # select relative power
+      df_full <- data.frame(mat_structure[5]) # 5 is the position of powspctrm in matlab structure 
+    } else{
+      mat_structure <- mat$totalpower.itpc.itlc # select itpc
+      df_full <- data.frame(mat_structure[8]) # 8 is the position of itpc in matlab structure 
+      } 
+      
+    part_no <- substr(filelist[no_file],28,35) #get participant number from filename
+    group <- get_group(part_no) #get group from participant number
+    long_df <- transform_tf(mat_structure,df_full, scale = scale)
+    df_empty[no_file,] <- cbind(long_df, part_no, group) #assign each participant to one row
+    names(df_empty) <- c(names(long_df), "part_no", "group")
+    }
+  
+  output <- list("type" = ifelse(rel, "rel_power", "itpc"), "data" = df_empty)
+  return(output)
+}
+
+
+
+```
+
+# Reading and Transforming Dataframes
+
+Application of the previously defined functions to load ITPC data
+
+```{r warning=FALSE}
+
+# Instantiate empty dataframe of fitting size: 
+# 28 rows, one for each participant
+# Number of columns: 32*39*71 +2
+# 32 for 32 electrodes
+# 39 for 1 Hz frequency bins from 2 to 40 Hz 
+# 71 for 20ms time bins from -700 to + 700 ms 
+# +2 for participant number and group
+
+empty_cat <- data.frame(matrix(NA, nrow = 25, ncol = 32*2769+2))
+empty_con <- empty_cat
+
+scale = FALSE
+rel = FALSE # Indicates whether relative power change shall be loaded, if not then ITPC is loaded
+
+path <- paste("/home/bpn/Dokumente/Max/Data/Wavelet/wavelets_exp1/", 
+              ifelse(rel,"Rel_Power","ITPC"),
+              sep = "")
+
+#get filenames from cataract directory (indicated by "TVD")
+filelist_cat <- get_filelist(path,"TVD")
+
+#Write control dataframes to list of dataframes
+cat <- write_files_to_list(filelist_cat, empty_cat, scale = scale, rel = rel)
+
+#get filenames from cataract directory (indicated by "CO")
+filelist_con <- get_filelist(path,"CO")
+
+#Write control dataframes to list of dataframes
+con <- write_files_to_list(filelist_con, empty_con, scale = scale, rel = rel)
+  
+```
+
+Application of the previously defined functions to load Relative Power Change data
+
+```{r warning=FALSE}
+
+scale = FALSE
+rel = TRUE # Indicates whether relative power change shall be loaded, if not then ITPC is loaded
+
+path <- paste("/home/bpn/Dokumente/Max/Data/Wavelet/wavelets_exp1/", 
+              ifelse(rel,"Rel_Power","ITPC"),
+              sep = "")
+
+#get filenames from cataract directory
+filelist_cat <- get_filelist(path,"TVD")
+
+#Write control dataframes to list of dataframes
+cat_rel <- write_files_to_list(filelist_cat,empty_cat, scale = scale, rel = rel)
+
+#get filenames from cataract directory
+filelist_con <- get_filelist(path,"CO")
+
+#Write control dataframes to list of dataframes
+con_rel <- write_files_to_list(filelist_con, empty_con, scale = scale, rel = rel)
+
+```
+
+# Combining both lists of dataframes
+
+Creation of a new empty list of dataframes, this time with dimensions 52x34 (2 exta columns for participant number and group). Cataract individuals fill the first 26 rows and control individuals the last 26 rows for each timepoint.
+
+```{r}
+
+nrows = 50 # 50 participants for experiment 1
+
+# Explanation for number of columns: Same as when loading the data
+total_pow <- data.frame(matrix(NA, nrow = nrows, ncol = 32*39*71+2))
+total_itpc <- data.frame(matrix(NA, nrow = nrows, ncol = 32*39*71+2))
+
+# The rows are filled first with cataract, and then with control individuals
+total_itpc[1:(nrows/2),] <- cat$data
+total_itpc[(nrows/2+1):nrows,] <- con$data
+total_pow[1:(nrows/2),] <- cat_rel$data
+total_pow[(nrows/2+1):nrows,] <- con_rel$data
+
+names(total_pow) <- names(cat_rel$data)
+names(total_itpc) <- names(cat$data)
+
+
+# Select only posterior electrodes (by name)
+post_pow <- total_pow
+post_itpc <- total_itpc
+post_pow <- post_pow[, grep(pattern="^TP9|CP5|CP1|CP2|CP6|TP10|P7|P3|Pz|P4|P8|O1|O2|part_no|group", colnames(post_pow))]
+post_itpc <- post_itpc[, grep(pattern="^TP9|CP5|CP1|CP2|CP6|TP10|P7|P3|Pz|P4|P8|O1|O2|part_no|group", colnames(post_itpc))]
+
+
+# Select only timepoints from -100 to 500 ms for analysis: -700ms = 1ms, 700 ms = 71ms, -100 = 31ms, 500 = 61ms
+ms_string = sapply(c(31:61), function(x) paste(as.character(x),"_ms", sep =""))
+analysis_pattern = paste(ms_string,collapse = "|")
+analysis_pattern = paste(analysis_pattern, "part_no", "group", sep = "|")
+
+analysis_pow <- post_pow[, grep(pattern=analysis_pattern, colnames(post_pow))]
+analysis_itpc <- post_itpc[, grep(pattern=analysis_pattern, colnames(post_itpc))]
+
+```
+
+## Combining both ITPC and relative power data into one dataframe for combined domain analyses
+
+```{r}
+
+# Preprocess ITPC and Power
+itpc_comb <- analysis_itpc[,-c((ncol(analysis_itpc)-1) : ncol(analysis_itpc))] # Drop last two columns
+pow_comb <- analysis_pow[,-c((ncol(analysis_pow)-1) : ncol(analysis_pow))]  # Drop last two columns
+col_names <- names(itpc_comb) # Extract names
+
+# Normalize over all participants; needed as data is on different scales
+norm_image <- function(x) (x - mean(as.matrix(x))) / sd(as.matrix(x))
+itpc_comb <- norm_image(itpc_comb)
+pow_comb <- norm_image(pow_comb)
+
+# Combining both dataframes, and add the two columns participant number and group
+itpc_power <- cbind(itpc_comb, pow_comb, analysis_itpc[,c((ncol(analysis_itpc)-1) : ncol(analysis_itpc))])
+names(itpc_power) <- c(paste("itpc", names(itpc_comb), sep = "_"), paste("pow", names(pow_comb), sep = "_"),"part_no","group")
+
+# Sanity check: Mean and SD of combined dataframe, should be 0 and 1 or very close
+mean(as.matrix(itpc_power[,-c((ncol(itpc_power)-1) : ncol(itpc_power))]))
+sd(as.matrix(itpc_power[,-c((ncol(itpc_power)-1) : ncol(itpc_power))]))
+
+
+```
+
+# General functions for Analysis
+
+```{r}
+
+
+### Transform each dataframe according to needs
+transform_df <- function(data, control = TRUE) {
+
+  data <- data %>% mutate(isCC = factor(group != 'CC', labels = c("yes","no")))
+  data$group <- factor(data$group, levels = c("CC", "DC", "Control"))
+
+  if (control == FALSE) {
+    
+    data <- data[data$group %in% c('DC','CC'),]
+    
+  } else {
+    
+    data <- data
+    
+  }
+  
+  data <- data %>% dplyr::select(-c(part_no, group))
+  
+  return(data)
+}
+
+
+# Function to determine significance of AUC with Mann-Whitney-U-Test
+auc_wmw <- function(response, scores){
+  labels <- as.logical(response)
+  pos <- scores[labels]
+  neg <- scores[!labels]
+  wilcox.test(pos, neg)$p.value
+}
+
+
+### Combine SVM Weights to obtain the final classifier
+get_svm_classifier <- function(df, svm) {
+  
+  weights <- t(svm$coefs) %*% svm$SV # Dot product of SVM coefficients (alphas) and Support Vectors
+  weights_as_rows <- do.call(rbind, # Replicate weights to match the dimension of the dataframe
+                             replicate(dim(df)[1], 
+                             weights, 
+                             simplify=FALSE))
+
+    clf <- rowSums(df[,-ncol(df)]*weights_as_rows) #Multiply each feature (electrode) with the respective weight for each participant
+  
+  return(clf)
+}
+
+
+
+## Function for manual Cross-Validation using e1071
+inner_CV <- function(df, k, hpt_grid){
+  
+  # Create empty dataframe to store CV results
+  hpt_df_auc <- data.frame(matrix(NA, nrow = dim(hpt_grid)[1], ncol = k))
+  names(hpt_df_auc) <- seq(k)
+  
+  # Create Cross-Validation folds
+  flds <- createFolds(df$isCC, k = k, list = TRUE, returnTrain = FALSE)
+  
+  # Loop over CV folds
+  for (f in seq(k)){
+    
+    # Partitioning the Data in Training and Testing Data
+    names(flds)[1:k] <- "train"
+    names(flds)[f] <- "test"
+    train_df <- df[-flds$test,]
+    test_df <- df[flds$test,]
+    y_train <- as.factor(train_df[,ncol(train_df)])
+    X_train <- data.matrix(train_df[,-ncol(train_df)])
+    
+    # Loop over all Hyperparameter Grid Combinations    
+    for (i in seq(dim(hpt_grid)[1])){
+      
+      # Training an SVM with the respective Hyperparameter Grid Combination
+      hpt_svm <- svm(X_train, 
+                     y_train,
+                     kernel = "linear", 
+                     type = "C-classification",
+                     cost = hpt_grid[i,'cost'],
+                     class.weights = c("no" = as.numeric(1/table(train_df$isCC)[2]), 
+                                       "yes" = as.numeric(1/table(train_df$isCC)[1])),
+                     scale = FALSE)
+      
+      # Deriving a Classifier from the previously fitted SVM and unseen test data
+      clf <- get_svm_classifier(test_df, hpt_svm)
+
+      # Compute AUC value for the classifier
+      response <- ifelse(test_df$isCC == "yes",1,0)
+      dir = ifelse(train_df$isCC[1] == "no", ">", "<") # direction depends on whether the first case is a CC or Non-CC
+      rocObject <- roc(response, clf, direction = dir, print_auc = TRUE, quiet = TRUE)
+      
+      # Storing AUC values in dataframe
+      hpt_df_auc[i,f] <- as.numeric(rocObject$auc)
+    }
+  }
+  
+  # Store mean AUCs for each Hyperparameter Combination over all folds with corresponding Hyperparameters
+  cv_results <- data.frame(matrix(NA, 
+                               nrow = dim(hpt_grid)[1], 
+                               ncol = 2)) 
+  
+  # Determine Names of result set columns
+  names(cv_results) <-c("cost", "AUC")
+  
+  # Assign values to result set columns
+  cv_results[,"cost"] <- hpt_grid[,"cost"]
+  cv_results[,"AUC"] <- rowMeans(hpt_df_auc)
+
+  # Return Cost and Weight that yielded the best mean AUC over all folds. 
+  # If more Combinations yielded the same best result, the first one is chosen
+  best_tune <- cv_results[cv_results[,"AUC"] == max(cv_results$AUC), ]
+  
+  # If more than one best combination, choose a random one
+  no_best_res <- dim(best_tune)[1]
+  if (no_best_res > 1)
+  output <- c(best_tune[sample(1:no_best_res,1),]) else
+  output <- c(best_tune)
+  
+  return(output)
+}
+
+
+
+```
+
+# Feature Selection for all conditions
+
+```{r}
+
+# Function to get all parameters from cva.glmnet function 
+# (taken from Stack Overflow, adapted to own needs)
+get_model_params <- function(cv, control_ = control) {
+  alpha <- cv$alpha
+  lambdaMin <- sapply(cv$modlist, `[[`, "lambda.min")
+  lambdaSE <- sapply(cv$modlist, `[[`, "lambda.1se")
+  
+  if (control_) {
+    error <- sapply(cv$modlist, function(mod) {max(mod$cvm)}) 
+    best <- which.max(error)
+  } else {
+    error <- sapply(cv$modlist, function(mod) {min(mod$cvm)})
+    best <- which.min(error)
+  }
+    
+  data.frame(alpha = alpha[best], lambda.min = lambdaMin[best],
+             lambda.se = lambdaSE[best], error = error[best])
+}
+
+# Function to tune alpha and lambda of the elastic Net model in a repeated CV fashion
+tune_alpha_lambda <- function(itpc_ = itpc, control_ = control, combined_ = combined, repetitions = 5000){
+  
+  # Choose correct dataframe: ITPC, Relative Power change or Combined Dataframe
+  if (itpc_) 
+      df <- transform_df(analysis_itpc, control = control_) else
+      df <- transform_df(analysis_pow, control = control_)
+  
+  if (combined_)
+    df <- transform_df(itpc_power, control = control_)
+  
+  y <- as.vector(df[,ncol(df)])
+  X <- data.matrix(df[,-ncol(df)])
+  
+  # Adapt range of alphas to exclude the possibility of pure L1 or pure L2 penalty to ensur that a mixture of both is used
+  alpha_range = seq(0, 1, len=11)^3 # Default alpha range from cva.glmnet()
+  alpha_range = alpha_range[2:10] # Excluding 0 and 1 from possible alpha range
+  
+  registerDoParallel(12) # Registering 12 cores for parallel processing
+  
+  # Tuning alpha and lambda for x repetitions.
+  # The performance measure is set to MSE ("class") when control participants 
+  # are not included, as cva does not allow AUC with less than 10 cases per fold.  
+  tune <- foreach(i = 1:repetitions, .combine = rbind) %dopar% {
+    cva <- suppressWarnings(cva.glmnet(X, y, 
+                                      family = "binomial", 
+                                      type.measure = ifelse(control_,"auc","class"), 
+                                      alpha = alpha_range, 
+                                      standardize = F,
+                                      nfolds = inner_k))
+    params <- get_model_params(cva, control_)
+    params
+  }
+
+  # Count the pairs of alpha and lambda values
+  count_al <- tune %>% 
+    group_by(alpha, lambda.min) %>%
+    summarise(n = n())
+  
+  # Select the pair of values that appears most often
+  best_params <- count_al[which.max(count_al$n),c("alpha", "lambda.min")]
+  
+  # Fit a glmnet model with the best value for alpha and 
+  # obtain coefficients at the best value of lambda
+  fit <- glmnet(X, y, alpha = best_params$alpha, family = "binomial", standardize = F, dfmax = ncol(X) / ifelse(combined_, 20, 10))
+  coefs <- coef(fit,s = best_params$lambda.min)
+  
+  output <- list("tune" = tune, "best_params" = best_params, "coefs" = coefs)
+  output
+}
+
+
+# Set parameters for data
+combined = FALSE
+inner_k = 3
+
+# ITPC CC vs. Non-CC
+itpc = T
+control = T
+tune_itpc_control <- tune_alpha_lambda(itpc, control, combined, repetitions = 5000)
+saveRDS(tune_itpc_control,"final_features_itpc_control.RDS")
+
+# Power CC vs. Non-CC
+itpc = F
+control = T
+tune_pow_control <- tune_alpha_lambda(itpc, control, combined, repetitions = 5000)
+saveRDS(tune_pow_control,"final_features_pow_control.RDS")
+
+# ITPC CC vs. DC
+itpc = T
+control = F
+tune_itpc_dc <- tune_alpha_lambda(itpc, control, combined, repetitions = 5000)
+saveRDS(tune_itpc_dc,"final_features_itpc_dc.RDS")
+
+# Power CC vs. DC
+itpc = F
+control = F
+tune_pow_dc <- tune_alpha_lambda(itpc, control, combined, repetitions = 5000)
+saveRDS(tune_pow_dc,"final_features_pow_dc.RDS")
+
+
+
+## Combined
+combined = TRUE
+
+# ITPC CC vs. Non-CC
+control = T
+tune_combi_control <- tune_alpha_lambda(control, combined, repetitions = 100)
+saveRDS(tune_combi_control,"final_features_combined_control_st.RDS")
+
+# Power CC vs. DC
+control = F
+tune_combi_dc <- tune_alpha_lambda(control, combined, repetitions = 100)
+saveRDS(tune_combi_dc,"final_features_combined_dc_st.RDS")
+
+```
+
+# Weight visualization - constrained
+
+```{r warning=FALSE}
+
+# Function to visualize weight summed up across all electrodes
+visualize_weights <- function(itpc_ = itpc, control_ = control, combined = combined, dfmax = TRUE){
+  
+  # Choose dataframe
+  if (itpc_) 
+      df <- transform_df(analysis_itpc, control = control_) else
+      df <- transform_df(analysis_pow, control = control_)
+      
+  y <- as.vector(df[,ncol(df)])
+  X <- data.matrix(df[,-ncol(df)])
+
+  # Read selected features and hyperparamter that correspond to these features
+  tune <- readRDS(paste("Final_RDS_files/final_features_", 
+                        ifelse(itpc_,"itpc_","pow_"), 
+                        ifelse(control_,"control","dc"), 
+                        ".RDS", sep = ""))
+  
+  # Select best alpha and lambda from Hyperparameter Tuning and fit Elastic Net LogReg
+  # dfmax indicates whether the max number of features is limited to 10% of all features or not
+  best_params = tune$best_params
+  if (dfmax)
+    fit <- glmnet(X, y, alpha = best_params$alpha, family = "binomial", standardize = F, dfmax = ncol(X) / 10) else
+      fit <- glmnet(X, y, alpha = best_params$alpha, family = "binomial", standardize = F) 
+  
+  coefs <- coef(fit,s = best_params$lambda.min)
+  
+  # Obtain Weights from Elastic Net Model and format them such that 
+  weights <- as.matrix(coefs)[2:length(coefs),]
+  weight_df <- as.data.frame(weights)
+  weight_df$name  <- rownames(weight_df) # Assign coefficient names as rownames
+  
+  # Extract the electrode, timepoint and frequency name from coefficient name for later grouping
+  weight_df$electrode <- substr(weight_df$name  ,1,3)
+  weight_df$timepoint <- (as.numeric(gsub("_ms","", str_extract(weight_df$name ,"([0-9]{1,2}_ms)")))-36)*20
+  weight_df$frequency <- as.numeric(gsub("_hz","", str_extract(weight_df$name ,"([0-9]{1,2}_hz)")))
+  #weight_df <- weight_df[weight_df$electrode == "CP6",]
+
+  # Group weights by timepoint and frequency and sum over the remaining dimension, i.e., electrodes
+  weight_df <- weight_df %>% 
+     group_by(timepoint, frequency) %>%
+     dplyr::summarize(weight_sum = sum(abs(weights))) %>%
+     ungroup()
+  
+  # Plot weight sums
+  ggplot(weight_df, aes(timepoint, frequency, fill = abs(weight_sum))) + 
+    geom_tile()+
+    scale_fill_continuous(low="white", high="#0072B2", 
+                         guide="colorbar",na.value="white") +
+    theme_bw(base_size = 15) +
+    geom_hline(yintercept = 4, size = 0.5, linetype='dotted') +
+    geom_hline(yintercept = 8, size = 0.5, linetype='dotted') +
+    geom_hline(yintercept = 13, size = 0.5, linetype='dotted') +
+    geom_hline(yintercept = 30, size = 0.5, linetype='dotted') +
+    theme(axis.line = element_line(size = 0.2, color = 'black'),
+         panel.grid.major = element_blank(),
+         panel.grid.minor = element_blank(),
+         plot.background = element_blank(),
+         panel.border = element_blank(),
+         panel.grid.major.y = element_line(size=0.02, color="black"),
+         plot.title = element_text(size = 14,family="Helvetica", hjust = 0.5),
+         axis.title.y = element_text(size = 12, angle = 90,family="Helvetica"),
+         axis.title.x = element_text(size = 12, angle = 0, family="Helvetica"),
+         axis.text.x = element_text(size = 8, colour="black"),
+         axis.ticks.x = element_line(size = 0.2, colour="black"),
+         axis.text.y = element_text(size = 8, colour="black"),
+         axis.ticks.y = element_line(size = 0.2, colour="black")) +
+    ggtitle(paste("Elastic Net weights at CP6 - ", 
+                  ifelse(itpc, "ITPC", "Relative Power"), 
+                  ifelse(control, "(CC vs. Non-CC)", "(CC vs. DC)")))+
+    xlab("Timepoints in ms") +
+           ylab("Frequency in Hz")
+
+  
+}
+
+## ITPC CC vs Non-CC
+combined = F
+itpc = T
+control = T
+visualize_weights(itpc, control, combined)
+
+## Power CC vs Non-CC
+itpc = F
+control = T
+visualize_weights(itpc, control, combined)
+
+## ITPC CC DC
+itpc = T
+control = F
+visualize_weights(itpc, control, combined)
+
+## Power CC vs DC
+itpc = F
+control = F
+visualize_weights(itpc, control, combined)
+
+
+```
+
+# Weight visualization - unconstrained (i.e., no upper bound on the umber of features selected)
+
+```{r}
+
+## ITPC CC vs Non-CC
+itpc = T
+control = T
+visualize_weights(itpc, control, combined, dfmax = FALSE)
+
+## Power CC vs Non-CC
+itpc = F
+control = T
+visualize_weights(itpc, control, combined, dfmax = FALSE)
+
+## ITPC CC vs DC
+itpc = T
+control = F
+visualize_weights(itpc, control, combined, dfmax = FALSE)
+
+## Power CC vs DC
+itpc = F
+control = F
+visualize_weights(itpc, control, combined, dfmax = FALSE)
+
+
+
+```
+
+
+# Weight visualization for combined domain analyses (i.e., ITPC + relative Power)
+
+
+```{r warning=FALSE}
+
+# Function to visualize the weights selected in the combined domain analyses
+viz_func <- function(coefficients = coefs, itpc_ = itpc, control_ = control) {
+  
+    # Same procedure of weight summation as in function above
+    weights <- as.matrix(coefficients)[2:length(coefficients),]
+    weight_df <- as.data.frame(weights)
+    weight_df$name  <- rownames(weight_df)
+    weight_df$electrode <- substr(weight_df$name  ,1,3)
+    weight_df$timepoint <- (as.numeric(gsub("_ms","", str_extract(weight_df$name ,"([0-9]{1,2}_ms)")))-36)*20
+    weight_df$frequency <- as.numeric(gsub("_hz","", str_extract(weight_df$name ,"([0-9]{1,2}_hz)")))
+    
+    weight_df <- weight_df %>% 
+      group_by(timepoint, frequency) %>%
+      dplyr::summarize(weight_sum = sum(abs(weights))) %>%
+      ungroup()
+  
+    # Plot weights
+    plot <- ggplot(weight_df, aes(timepoint, frequency, fill = weight_sum)) + 
+    geom_tile()+
+    scale_fill_continuous(low="white", high="#0072B2", 
+                         guide="colorbar",na.value="white") +
+    theme_bw(base_size = 15) +
+    geom_hline(yintercept = 4, size = 0.5, linetype='dotted') +
+    geom_hline(yintercept = 8, size = 0.5, linetype='dotted') +
+    geom_hline(yintercept = 13, size = 0.5, linetype='dotted') +
+    geom_hline(yintercept = 30, size = 0.5, linetype='dotted') +
+    theme(axis.line = element_line(size = 0.2, color = 'black'),
+         panel.grid.major = element_blank(),
+         panel.grid.minor = element_blank(),
+         plot.background = element_blank(),
+         panel.border = element_blank(),
+         panel.grid.major.y = element_line(size=0.02, color="black"),
+         plot.title = element_text(size = 14,family="Helvetica", hjust = 0.5),
+         axis.title.y = element_text(size = 12, angle = 90,family="Helvetica"),
+         axis.title.x = element_text(size = 12, angle = 0, family="Helvetica"),
+         axis.text.x = element_text(size = 8, colour="black"),
+         axis.ticks.x = element_line(size = 0.2, colour="black"),
+         axis.text.y = element_text(size = 8, colour="black"),
+         axis.ticks.y = element_line(size = 0.2, colour="black")) +
+    ggtitle(paste("Elastic Net weight sums - ", 
+                  ifelse(itpc_, "Combined (ITPC -", "Combined (Relative Power -"), 
+                  ifelse(control_, "CC vs. Non-CC)", "CC vs. DC)")))+
+    xlab("Timepoints in ms") +
+           ylab("Frequency in Hz") +
+      
+    # Annotate the number of features in plot
+    annotate("text", x = 200, y = 35, label = paste("No. of features:", length(which(coefficients != 0)), sep = " "))
+    
+    return(plot)
+    
+}
+
+# Function to utilize the above defined viz_func to visualize either the itpc or the power features
+visualize_weights_combined <- function(itpc_ = itpc, control_ = control){
+  
+
+  df <- transform_df(itpc_power, control = control_)
+      
+  y <- as.vector(df[,ncol(df)])
+  X <- data.matrix(df[,-ncol(df)])
+
+    # Read optimal alpha and lambda from Hyperparameter Tuning
+  tune <- readRDS(paste("Final_RDS_files/final_features_combined_", 
+                        ifelse(control_,"control","dc"), 
+                        ".RDS", sep = ""))
+  
+  # same procedure of training an Elastic Net LogReg based on the optimal alpha and lambda
+  best_params = tune$best_params
+  fit <- glmnet(X, y, alpha = best_params$alpha, family = "binomial", standardize = F, dfmax = ncol(X) / 20)
+  coefs <- coef(fit,s = best_params$lambda.min)
+  
+  # Select coefficients that are named either itpc or power, as visualizatio only works for one domain at once
+  coefficients <- coefs[grep(pattern=paste("^",ifelse(itpc_, "itpc","pow"),"|part_no|group",sep =""), coefs@Dimnames[[1]]),]
+  viz_func(coefficients, itpc_, control_)
+
+}
+
+## Combined CC vs. Non-CC
+control = T
+visualize_weights_combined(T, control)
+visualize_weights_combined(F, control)
+
+## Combined CC vs. DC
+control = F
+visualize_weights_combined(T, control)
+visualize_weights_combined(F, control)
+
+```
+
+# Tune SVMs with selected features
+
+```{r}
+
+# Define function for tuning an SVM with the selected features
+tune_svm_selected_feat <- function(itpc_ = itpc, control_ = control, combined_ = combined, rep = 5000) {
+  
+  # Read in tuning results and data depending on whether we use the combined dataframe or not. 
+  # if not, then we choose based on whether the ITPC is selected or not (== Power).
+  
+  # Select correct DFs and namings
+  if(combined_) {
+    domain = "combined_" 
+    df <- transform_df(itpc_power, control = control_) 
+  } else {
+    domain = ifelse(itpc_, "itpc_", "pow_")
+    if (itpc_) 
+      df <- transform_df(analysis_itpc, control = control_) else
+        df <- transform_df(analysis_pow, control = control_) 
+  }
+      
+  group <- ifelse(control_, "control","dc")
+  
+  # Load weights
+  features <- readRDS(paste("Final_RDS_files/final_features_",
+                            domain,
+                            group,
+                            ".RDS", sep = ""))
+  
+  # Feature Subset
+  coefs <- features$coefs
+  # Select the names of coefficients which are not zero
+  selected_features = coefs@Dimnames[[1]][which(coefs != 0)] 
+  # Drop Intercept from and add isCC to feature list
+  selected_features = c(selected_features[2:length(selected_features)],"isCC") 
+  # Subset dataframe to only selected features
+  df = df[selected_features]
+  
+  
+  # Set parameters for HPT CV 
+  repeats = rep # How many times nested CV is repeated for each timepoint
+  inner_k = ifelse(control_,5,3) # k for inner loop of nested CV - depends on whether controls are included
+  
+  # Define coarse Grid of Hyperparameters to search over in inner CV
+  coarse_grid <- expand.grid(cost = 2^(seq(-5,15)))
+  
+  #register 12 cores
+  registerDoParallel(12)
+  
+  # Loop over all timepoints
+  hpt_results <- foreach(ms = 1:repeats, .combine = rbind) %dopar% {
+  
+    # Running CV Loop to determine best Hyperparameters:
+    # First running a k-fold CV on the coarse grid and then fine-searching in the nearby areas
+    coarse_cv <- inner_CV(df, inner_k, coarse_grid)
+    best_coarse_cost <- log(coarse_cv$cost, 2)
+    
+    # Generating a fine grid based on best cost of coarse CV
+    fine_grid <- expand.grid(cost = 2^(seq(best_coarse_cost-2,
+                                           best_coarse_cost+2,
+                                           0.25)))
+    best_hpts <- inner_CV(df, inner_k, fine_grid)
+    
+    
+    # Save best Costs found in the Hyperparameter Tuning
+    best_hpts$cost
+  
+  }
+
+  hpt_results
+  
+}
+
+
+## Running function for single domains (i.e., ITPC and relative power change)
+combined = F
+
+# ITPC CC vs. Non-CC
+itpc = T
+control = T
+hpt_results <- tune_svm_selected_feat(itpc, control, combined)
+saveRDS(hpt_results, "hpt_results_itpc_control.RDS")
+
+# Power CC vs. Non-CC
+itpc = F
+control = T
+hpt_results <- tune_svm_selected_feat(itpc, control, combined)
+saveRDS(hpt_results, "hpt_results_pow_control.RDS")
+
+# ITPC CC vs. DC
+itpc = T
+control = F
+hpt_results <- tune_svm_selected_feat(itpc, control, combined)
+saveRDS(hpt_results, "hpt_results_itpc_dc.RDS")
+
+# Power CC vs. DC
+itpc = F
+control = F
+hpt_results <- tune_svm_selected_feat(itpc, control, combined)
+saveRDS(hpt_results, "hpt_results_pow_dc.RDS")
+
+
+### Combined ####
+
+combined = T
+
+# Combined CC vs. Non-CC
+control = T
+hpt_results <- tune_svm_selected_feat(itpc, control, combined)
+saveRDS(hpt_results, "hpt_results_combined_control.RDS")
+
+# Combined CC vs. DC
+control = F
+hpt_results <- tune_svm_selected_feat(itpc, control, combined)
+saveRDS(hpt_results, "hpt_results_combined_dc.RDS")
+
+
+```
+
+# Get weights from tuned & fitted SVMs
+
+```{r}
+
+# Function to extract weights and optimal threshold from final SVM 
+# using the previously selected features and the previously tuned HPTs
+svm_weights <- function(itpc_ = itpc, control_ = control, combined_ = combined){
+  
+    # Load data
+    if(combined_) {
+      domain = "combined_" 
+      df <- transform_df(itpc_power, control = control_) 
+    } else {
+      domain = ifelse(itpc_, "itpc_", "pow_")
+      if (itpc_) 
+        df <- transform_df(analysis_itpc, control = control_) else
+          df <- transform_df(analysis_pow, control = control_) 
+    }
+        
+    group <- ifelse(control_, "control","dc")
+    
+    # Load weights
+    features <- readRDS(paste("Final_RDS_files/final_features_",
+                              domain,
+                              group,
+                              ".RDS", sep = ""))  
+    
+    hpts <- readRDS(paste("Final_RDS_files/hpt_results_",
+                              domain,
+                              group,
+                              ".RDS", sep = ""))
+  
+  # Feature Subset
+  coefs <- features$coefs
+  # Select the names of coefficients which are not zero
+  selected_features = coefs@Dimnames[[1]][which(coefs != 0)] 
+  # Drop Intercept from and add isCC to feature list
+  selected_features = c(selected_features[2:length(selected_features)],"isCC") 
+  # Subset dataframe to only selected features
+  df = df[selected_features]
+  
+  # Select best cost
+  best_cost = as.numeric(names(sort(table(hpts), decreasing = TRUE)[1]))
+  
+  # Tune final SVm with best cost and selected features
+  final_model <- svm(isCC ~ ., 
+                     data = df, 
+                     kernel = "linear", 
+                     cost = best_cost,
+                     class.weights = "inverse",
+                       
+                     scale = FALSE)
+  
+  # Derive classifier and perform ROC analysis
+  weights <- t(final_model$coefs) %*% final_model$SV 
+  clf <- get_svm_classifier(df,final_model)
+  response <- ifelse(df$isCC == "yes",1,0)
+
+  rocObject<- roc(response,
+                    clf,
+                    print_auc = TRUE,
+                    quiet = TRUE)
+  
+  # get the best threshold by maximizing Youden's J  
+  threshold <- coords(rocObject, x = "best", best.method = "y", ret = "threshold", transpose = TRUE)
+  
+  list("weights" = weights, "threshold" = threshold)
+}
+
+
+
+## Running function for all configurations
+combined = FALSE
+
+# ITPC CC vs. Non-CC
+itpc = T
+control = T
+weights <- svm_weights(itpc, control, combined)
+saveRDS(weights, "weights_itpc_control.RDS")
+
+# Power CC vs. DC
+itpc = F
+control = T
+weights <- svm_weights(itpc, control, combined)
+saveRDS(weights, "weights_pow_control.RDS")
+
+# ITPC CC vs. DC
+itpc = T
+control = F
+weights <- svm_weights(itpc, control, combined)
+saveRDS(weights, "weights_itpc_dc.RDS")
+
+# Power CC vs. DC
+itpc = F
+control = F
+weights <- svm_weights(itpc, control, combined)
+saveRDS(weights, "weights_pow_dc.RDS")
+
+
+###############
+combined = TRUE
+
+# Combined CC vs. Non-CC
+control = T
+weights <- svm_weights(itpc, control, combined)
+saveRDS(weights, "weights_combined_control.RDS")
+
+# Combined CC vs. DC
+control = F
+weights <- svm_weights(itpc, control, combined)
+saveRDS(weights, "weights_combined_dc.RDS")
+
+
+```
+
+# Performance Estimation
+
+Only used for personal exploration and not reported in the Thesis.
+Incorporates all of the above defined functions in a nested cross-validation manner, and is thus not commented again
+
+```{r}
+
+#itpc_power <- itpc_power[, grep(pattern="^itpc|part_no|group", colnames(itpc_power))]
+
+itpc_ = TRUE
+control_ = F
+combined_ = T
+repeats = 24 # How many times nested CV is repeated for each timepoint
+outer_k = 3 # k for outer loop of nested CV 
+inner_k = 3 #ifelse(control,5,3) # k for inner loop of nested CV - depends on whether controls are included
+
+
+# Function to extract best parameters from HPT
+get_model_params <- function(cv, control_ = control) {
+  alpha <- cv$alpha
+  lambdaMin <- sapply(cv$modlist, `[[`, "lambda.min")
+  lambdaSE <- sapply(cv$modlist, `[[`, "lambda.1se")
+  
+  if (control_) {
+    error <- sapply(cv$modlist, function(mod) {max(mod$cvm)}) 
+    best <- which.max(error)
+  } else {
+    error <- sapply(cv$modlist, function(mod) {min(mod$cvm)})
+    best <- which.min(error)
+  }
+    
+  data.frame(alpha = alpha[best], lambda.min = lambdaMin[best],
+             lambda.se = lambdaSE[best], error = error[best])
+}
+
+
+#performance_estimation <- function(itpc_ = itpc, control_ = control, repeats = 500) {
+  
+if (itpc_) 
+  df <- transform_df(analysis_itpc, control = control_) else
+  df <- transform_df(analysis_pow, control = control_)
+
+if (combined_)
+  df <- transform_df(itpc_power, control = control_)
+
+# Setting up grids to search
+alpha_range = seq(0, 1, len=11)^3 # Default alpha range from cva.glmnet()
+alpha_range = alpha_range[2:10] # excluding 0 and 1 from possible alpha range
+coarse_grid <- expand.grid(cost = 2^(seq(-5,15)))
+
+# Setting up empty lists
+auc_list <- c()
+cost_list <- c()
+best_alpha <- c()
+best_lambda <- c()
+val_df <- data.frame()
+output_df <- data.frame()
+
+#for (i in seq(repeats)) {
+
+registerDoParallel(12)
+output_df <- foreach(i = seq(repeats), .combine = rbind) %dopar% {
+  
+  # Creating outer Folds
+  outer_flds <- createFolds(df$isCC, 
+                            k = outer_k, 
+                            list = TRUE, 
+                            returnTrain = FALSE)
+  
+  for (o_f in seq(outer_k)){
+     
+    # Partitioning the Data in Training and Testing Data for Outer Loop
+    names(outer_flds)[1:outer_k] <- "train"
+    names(outer_flds)[o_f] <- "test"
+    outer_train_df <- df[-outer_flds$test,]
+    outer_test_df <- df[outer_flds$test,]
+    
+    y_inner <- as.vector(outer_train_df[,ncol(outer_train_df)])
+    X_inner <- data.matrix(outer_train_df[,-ncol(outer_train_df)])
+    
+    # Tuning alpha and lambda for x repetitions.
+    # The performance measure is set to MSE ("class") when control participants 
+    # are not included, as cva does not allow AUC with less than 10 cases per fold.  
+    cva <- suppressWarnings(cva.glmnet(X_inner, y_inner, 
+                            family = "binomial", 
+                            type.measure = ifelse(control_,"auc","class"), 
+                            alpha = alpha_range, 
+                            standardize = F,
+                            nfolds = inner_k))
+    
+    params <- get_model_params(cva, control_)
+    
+    while (params$lambda.min == params$lambda.se) {
+      
+      cva <- suppressWarnings(cva.glmnet(X_inner, y_inner, 
+                              family = "binomial", 
+                              type.measure = ifelse(control_,"auc","class"), 
+                              alpha = alpha_range, 
+                              standardize = F,
+                              nfolds = inner_k))
+    
+      params <- get_model_params(cva, control_)
+      
+    }
+    
+    fit <- glmnet(X_inner, 
+                  y_inner, 
+                  alpha = params$alpha, 
+                  family = "binomial", 
+                  standardize = F, 
+                  dfmax = ncol(X_inner) / ifelse(combined_,20,10))
+    
+    coefs <- coef(fit,s = params$lambda.min)
+    
+    # Feature Selection
+    
+    # Select the names of coefficients which are not zero
+    selected_features = coefs@Dimnames[[1]][which(coefs != 0)] 
+    # Drop Intercept from and add isCC to feature list
+    selected_features = c(selected_features[2:length(selected_features)],"isCC") 
+    # Subset dataframe to only selected features
+    outer_train_df_selected = outer_train_df[selected_features]
+    outer_test_df_selected = outer_test_df[selected_features]
+    
+    # Hyperparameter Tuning
+    # Running CV Loop to determine best Hyperparameters:
+    # First running a k-fold CV on the coarse grid and then fine-searching in the nearby areas
+    coarse_cv <- inner_CV(outer_train_df_selected, inner_k, coarse_grid)
+    best_coarse_cost <- log(coarse_cv$cost, 2)
+    
+    # Generating a fine grid based on best cost of coarse CV
+    fine_grid <- expand.grid(cost = 2^(seq(best_coarse_cost-2,
+                                           best_coarse_cost+2,
+                                           0.25)))
+    best_hpts <- inner_CV(outer_train_df_selected, inner_k, fine_grid)
+    
+    
+    # Train Model on all data of the inner loop with best Hyperparameters
+    outer_model <- svm(isCC ~ ., 
+                   data = outer_train_df_selected, 
+                   kernel = "linear", 
+                   type = "C-classification",
+                   cost = best_hpts$cost,
+                   class.weights = c("no" = as.numeric(1/table(outer_train_df$isCC)[2]), 
+                                    "yes" = as.numeric(1/table(outer_train_df$isCC)[1])),
+                   scale = F)
+    
+
+    # Predict Test Fold of the outer Loop:
+    # Computing an AUC through weights and raw electrode data
+    clf_train <- get_svm_classifier(outer_train_df_selected, outer_model)
+    response_train <- ifelse(outer_train_df_selected$isCC == "yes",1,0)
+    dir = ifelse(outer_train_df_selected$isCC[1] == "no", ">", "<") 
+    rocObject_train <- roc(response_train,
+                           clf_train,
+                           direction = dir,
+                           print_auc = TRUE,
+                           quiet = TRUE)
+    
+    threshold_train <- coords(rocObject_train, x = "best", best.method = "y", ret = "threshold", transpose = TRUE)
+    
+    # Predictions for participants of test fold of the outer Loop:
+    # Computing an AUC through weights and raw electrode data
+    clf_test <- get_svm_classifier(outer_test_df_selected, outer_model)
+    response_test <- ifelse(outer_test_df_selected$isCC == "yes",1,0)
+    dir = ifelse(outer_train_df_selected$isCC[1] == "no", ">", "<") 
+    rocObject_test <- roc(response_test,
+                          clf_test,
+                          direction = dir,
+                          print_auc = TRUE,
+                          quiet = TRUE)
+    
+    # Write single repetition- and fold-results into list for later averaging
+    auc_list <- c(auc_list,rocObject_test$auc) # AUC value
+    cost_list <- c(cost_list, best_hpts$cost)
+    best_lambda <- c(best_lambda, params$lambda.min)
+    best_alpha <- c(best_alpha, params$alpha)
+    val <- coords(rocObject_test, threshold_train, input = "threshold", transpose = TRUE)
+    if (length(val) > 3) val <- val[,1] # In case there are two optimal points
+    val_df <- rbind(val_df,val)
+    names(val_df) = names(val)
+    
+    }
+  
+  output <- cbind(auc_list, cost_list, best_lambda, best_alpha, val_df[,1],val_df[,2],val_df[,3])
+  #output_df <- rbind(output_df, output)
+  #output_df
+}
+
+output_df <- as.data.frame(output_df)
+
+boxplot(output_df$auc_list, output_df$V7,output_df$V6,
+        names = c("AUC","Sensitivity","Specificity"),
+        col = "white")
+
+mean(output_df$auc_list)
+
+```
+
