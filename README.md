@@ -1,5 +1,4 @@
-# Master Thesis
-# Machine Learning Approaches to Develop EEG Biomarkers for Classifying Sight Restored Individuals
+# Master Thesis: Machine Learning Approaches to Develop EEG Biomarkers for Classifying Sight Restored Individuals
 
 This repository contains the scripts used for data analysis in my Master Thesis "Machine Learning Apporaches to Develop EEG Biomarkers for Classifying Sight Restored Individuals" in Developmental Cognitive Neuroscience (Psychology M.Sc.). Due to privacy reasons, original data and participant information is not included. The results will be published in an academic journal and are hence not reported here on GitHub. 
 
